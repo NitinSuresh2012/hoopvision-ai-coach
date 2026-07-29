@@ -341,21 +341,24 @@ function extractPostureFrame(result: PoseResult) {
   const rightShoulder = landmarks[12];
   const leftHip = landmarks[23];
   const rightHip = landmarks[24];
-  const trackedPoints = [
-    nose,
-    leftEye,
-    rightEye,
-    leftEar,
-    rightEar,
-    leftShoulder,
-    rightShoulder,
-    leftHip,
-    rightHip,
+  const faceSupportConfidence = Math.max(
+    pointConfidence(leftEye),
+    pointConfidence(rightEye),
+    pointConfidence(leftEar),
+    pointConfidence(rightEar),
+  );
+  const essentialConfidences = [
+    pointConfidence(nose),
+    faceSupportConfidence,
+    pointConfidence(leftShoulder),
+    pointConfidence(rightShoulder),
+    pointConfidence(leftHip),
+    pointConfidence(rightHip),
   ];
-  const confidence = trackedPoints.reduce(
-    (total, point) => total + pointConfidence(point),
+  const confidence = essentialConfidences.reduce(
+    (total, value) => total + value,
     0,
-  ) / trackedPoints.length;
+  ) / essentialConfidences.length;
   const torsoConfidence = Math.min(
     pointConfidence(leftShoulder),
     pointConfidence(rightShoulder),
@@ -378,14 +381,15 @@ function extractPostureFrame(result: PoseResult) {
     return invalidPostureFrame(landmarks, confidence, "pose", "NO_PERSON", 0);
   }
 
-  const hasHead = usablePosturePoint(nose, 0.5) &&
+  const hasHead = usablePosturePoint(nose, 0.42) &&
     (
-      usablePosturePoint(leftEye, 0.5) ||
-      usablePosturePoint(rightEye, 0.5) ||
-      usablePosturePoint(leftEar, 0.5) ||
-      usablePosturePoint(rightEar, 0.5)
+      usablePosturePoint(leftEye, 0.35) ||
+      usablePosturePoint(rightEye, 0.35) ||
+      usablePosturePoint(leftEar, 0.35) ||
+      usablePosturePoint(rightEar, 0.35)
     );
-  const hasShoulders = usablePosturePoint(leftShoulder) && usablePosturePoint(rightShoulder);
+  const hasShoulders = usablePosturePoint(leftShoulder, 0.45) &&
+    usablePosturePoint(rightShoulder, 0.45);
   const hasHips = usablePosturePoint(leftHip, POSTURE_HIP_CONFIDENCE) &&
     usablePosturePoint(rightHip, POSTURE_HIP_CONFIDENCE);
   const missing: MissingPostureRegion = !hasShoulders
@@ -422,7 +426,7 @@ function extractPostureFrame(result: PoseResult) {
   const visibleHeight = hipMid.y - headAnchor.y;
   const torsoLength = pointDistance(shoulderMid, hipMid);
 
-  if (torsoConfidence < POSTURE_LANDMARK_CONFIDENCE || bodyVisibility < 0.58) {
+  if (torsoConfidence < 0.42 || bodyVisibility < 0.48) {
     return invalidPostureFrame(
       landmarks,
       confidence,
@@ -822,6 +826,7 @@ export default function Home() {
   const postureBaselineRef = useRef<PostureMeasurement | null>(null);
   const postureWindowRef = useRef<{ timestamp: number; measurement: PostureMeasurement }[]>([]);
   const calibrationRef = useRef<CalibrationRun | null>(null);
+  const autoCalibrationStartedRef = useRef(false);
   const postureFlagsRef = useRef<PostureFlags>({ head: false, shoulders: false, back: false });
   const postureDisplayedScoreRef = useRef<number | null>(null);
   const postureScoreUpdatedAtRef = useRef(0);
@@ -888,6 +893,7 @@ export default function Home() {
       sustainedBadRef.current = null;
       postureInvalidSinceRef.current = null;
       calibrationRef.current = null;
+      autoCalibrationStartedRef.current = false;
       return;
     }
 
@@ -930,7 +936,11 @@ export default function Home() {
         if (cancelled) return;
 
         setPosturePhase(postureBaselineRef.current ? "active" : "ready");
-        setPostureInstruction(postureBaselineRef.current ? "Move fully into view" : "Sit correctly, then calibrate");
+        setPostureInstruction(
+          postureBaselineRef.current
+            ? "Posture tracking active"
+            : "Sit or stand upright for automatic calibration",
+        );
         setPostureCameraState("Looking for posture");
         setPostureStatus("NO_PERSON");
         setPostureFullPoseReady(false);
@@ -1045,6 +1055,29 @@ export default function Home() {
           postureInvalidSinceRef.current = null;
           setPostureFullPoseReady(true);
           setPostureStatus("GOOD_POSTURE");
+          if (!postureBaselineRef.current && !calibrationRef.current) {
+            autoCalibrationStartedRef.current = true;
+            calibrationRef.current = {
+              startedAt: now,
+              validMs: 0,
+              lastValidAt: now,
+              samples: [frame.measurement],
+            };
+            postureWindowRef.current = [];
+            postureFlagsRef.current = { head: false, shoulders: false, back: false };
+            postureDisplayedScoreRef.current = null;
+            postureScoreUpdatedAtRef.current = 0;
+            setPosturePhase("calibrating");
+            setPostureScore(null);
+            setPostureScores({ neck: 0, head: 0, shoulderLevel: 0, upperBack: 0, framing: 0 });
+            setPostureCorrection(null);
+            setPostureAngles(frame.measurement);
+            setCalibrationProgress(0);
+            setPostureInstruction("Sit or stand upright while baseline calibrates");
+            setPostureCameraState("CALIBRATING_BASELINE");
+            drawPostureOverlay(canvas, video, frame.landmarks, false);
+            return;
+          }
           const calibration = calibrationRef.current;
           if (calibration) {
             setPostureCameraState("Stage 2 · Saving baseline");
@@ -1066,6 +1099,7 @@ export default function Home() {
               const baseline = aggregateMeasurements(calibration.samples, true);
               postureBaselineRef.current = baseline;
               calibrationRef.current = null;
+              autoCalibrationStartedRef.current = false;
               postureWindowRef.current = [];
               postureFlagsRef.current = { head: false, shoulders: false, back: false };
               setPostureCalibrated(true);
@@ -1082,7 +1116,7 @@ export default function Home() {
           }
 
           const baseline = postureBaselineRef.current;
-          if (false && !baseline) {
+          if (!baseline) {
             setPostureCameraState("Stage 2 · Ready to calibrate");
             setPosturePhase("ready");
             setPostureScore(null);
@@ -1206,6 +1240,7 @@ export default function Home() {
         { label: "Shoulder level", value: !cameraOn || postureScore === null ? null : postureScores.shoulderLevel },
         { label: "Upper-back angle", value: !cameraOn || postureScore === null ? null : postureScores.upperBack },
         { label: "Body framing", value: !cameraOn || postureScore === null ? null : postureScores.framing },
+        { label: "Confidence", value: cameraOn ? postureConfidence : null },
       ]
     : scores;
   const postureAlerting = mode === "posture" &&
@@ -1255,6 +1290,7 @@ export default function Home() {
       lastValidAt: null,
       samples: [],
     };
+    autoCalibrationStartedRef.current = false;
     postureWindowRef.current = [];
     postureFlagsRef.current = { head: false, shoulders: false, back: false };
     postureDisplayedScoreRef.current = null;
@@ -1320,7 +1356,12 @@ export default function Home() {
       setSeconds(0);
       setChatOpen(true);
       if (mode === "posture") {
-        setPostureInstruction(postureBaselineRef.current ? "Move fully into view" : "Sit correctly, then calibrate");
+        postureBaselineRef.current = null;
+        calibrationRef.current = null;
+        autoCalibrationStartedRef.current = false;
+        setPostureCalibrated(false);
+        setPostureInstruction("Sit or stand upright for automatic calibration");
+        setPostureCameraState("Finding face, shoulders, torso, and hips");
       } else {
         coachSpeak("HoopVision live coach active. Set your base and begin when ready.");
       }
