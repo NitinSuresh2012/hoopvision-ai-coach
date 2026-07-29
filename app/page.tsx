@@ -87,7 +87,7 @@ const POSE_MODEL = "https://storage.googleapis.com/mediapipe-models/pose_landmar
 const POSTURE_BASELINE_KEY = "hoopvision-posture-baseline-v3";
 const POSTURE_WINDOW_MS = 2000;
 const POSTURE_LANDMARK_CONFIDENCE = 0.5;
-const POSTURE_HIP_CONFIDENCE = 0.45;
+const POSTURE_HIP_CONFIDENCE = 0.32;
 
 const correctionCopy: Record<Exclude<PostureCorrection, null>, string> = {
   head: "Move your head back",
@@ -108,15 +108,17 @@ const postureStatusCopy: Record<PostureStatus, string> = {
 };
 
 type PostureCameraFeedback = {
-  score: number;
-  tone: "green" | "red";
+  score: number | null;
+  tone: "green" | "red" | "neutral";
   message:
     | "Posture aligned"
     | "Face the screen"
     | "Sit upright"
     | "Center your shoulders"
     | "Move back into frame"
+    | "Move closer to the camera"
     | "Move farther from the camera"
+    | "Sit upright while calibration completes"
     | "Posture unavailable — return to the camera";
 };
 
@@ -139,7 +141,8 @@ function getPostureCameraFeedback({
   score: number | null;
   status: PostureStatus;
 }): PostureCameraFeedback {
-  const rawScore = Number.isFinite(score) ? Number(score) : 0;
+  const rawScore = Number.isFinite(score) ? Number(score) : null;
+  const calibrating = phase === "calibrating" || (!calibrated && phase === "ready");
   const invalidView = !fullPoseReady ||
     confidence < 50 ||
     facingConfidence === null ||
@@ -149,30 +152,38 @@ function getPostureCameraFeedback({
     status === "TOO_FAR" ||
     status === "LOW_CONFIDENCE";
   const scoringReady = phase === "active" || phase === "ready";
-  const safeScore = !cameraOn ||
-    !scoringReady ||
-    status === "NO_PERSON"
-    ? 0
-    : invalidView
-      ? clamp(rawScore, 0, 29)
-      : clamp(rawScore, 0, 100);
+  const safeScore = !cameraOn || calibrating || rawScore === null
+    ? null
+    : status === "NO_PERSON"
+      ? 0
+      : invalidView
+        ? clamp(rawScore, 0, 29)
+        : clamp(rawScore, 0, 100);
   const green = cameraOn &&
     scoringReady &&
+    !calibrating &&
     fullPoseReady &&
     confidence >= 50 &&
     facingConfidence !== null &&
     facingConfidence >= 0.5 &&
     status === "GOOD_POSTURE" &&
+    safeScore !== null &&
     safeScore >= 85;
 
   let message: PostureCameraFeedback["message"];
-  if (!cameraOn || status === "NO_PERSON") {
+  if (!cameraOn) {
+    message = "Posture unavailable — return to the camera";
+  } else if (calibrating && fullPoseReady) {
+    message = "Sit upright while calibration completes";
+  } else if (status === "NO_PERSON") {
     message = "Posture unavailable — return to the camera";
   } else if (status === "TURNED_AWAY") {
     message = "Face the screen";
   } else if (status === "TOO_CLOSE") {
     message = "Move farther from the camera";
-  } else if (status === "TOO_FAR" || status === "LOW_CONFIDENCE") {
+  } else if (status === "TOO_FAR") {
+    message = "Move closer to the camera";
+  } else if (status === "LOW_CONFIDENCE") {
     message = "Move back into frame";
   } else if (status === "SHOULDERS_UNEVEN" || status === "LEANING") {
     message = "Center your shoulders";
@@ -183,8 +194,8 @@ function getPostureCameraFeedback({
   }
 
   return {
-    score: Math.round(safeScore),
-    tone: green ? "green" : "red",
+    score: safeScore === null ? null : Math.round(safeScore),
+    tone: calibrating ? "neutral" : green ? "green" : "red",
     message,
   };
 }
@@ -359,12 +370,15 @@ function extractPostureFrame(result: PoseResult) {
     (total, value) => total + value,
     0,
   ) / essentialConfidences.length;
-  const torsoConfidence = Math.min(
+  const shoulderConfidence = Math.min(
     pointConfidence(leftShoulder),
     pointConfidence(rightShoulder),
+  );
+  const hipConfidence = Math.max(
     pointConfidence(leftHip),
     pointConfidence(rightHip),
   );
+  const torsoConfidence = Math.min(shoulderConfidence, hipConfidence);
   const eyeConfidence = Math.max(pointConfidence(leftEye), pointConfidence(rightEye));
   const earConfidence = Math.max(pointConfidence(leftEar), pointConfidence(rightEar));
   const faceConfidence = Math.min(
@@ -390,8 +404,9 @@ function extractPostureFrame(result: PoseResult) {
     );
   const hasShoulders = usablePosturePoint(leftShoulder, 0.45) &&
     usablePosturePoint(rightShoulder, 0.45);
-  const hasHips = usablePosturePoint(leftHip, POSTURE_HIP_CONFIDENCE) &&
-    usablePosturePoint(rightHip, POSTURE_HIP_CONFIDENCE);
+  const hasLeftHip = usablePosturePoint(leftHip, POSTURE_HIP_CONFIDENCE);
+  const hasRightHip = usablePosturePoint(rightHip, POSTURE_HIP_CONFIDENCE);
+  const hasHips = hasLeftHip || hasRightHip;
   const missing: MissingPostureRegion = !hasShoulders
     ? "shoulders"
     : !hasHead
@@ -421,12 +436,16 @@ function extractPostureFrame(result: PoseResult) {
     ? midpoint(leftEye, rightEye)
     : nose;
   const shoulderMid = midpoint(leftShoulder, rightShoulder);
-  const hipMid = midpoint(leftHip, rightHip);
+  const hipMid = hasLeftHip && hasRightHip
+    ? midpoint(leftHip, rightHip)
+    : hasLeftHip
+      ? { ...leftHip, x: shoulderMid.x }
+      : { ...rightHip, x: shoulderMid.x };
   const shoulderWidth = pointDistance(leftShoulder, rightShoulder);
   const visibleHeight = hipMid.y - headAnchor.y;
   const torsoLength = pointDistance(shoulderMid, hipMid);
 
-  if (torsoConfidence < 0.42 || bodyVisibility < 0.48) {
+  if (confidence < 0.42 || shoulderConfidence < 0.45 || hipConfidence < POSTURE_HIP_CONFIDENCE || bodyVisibility < 0.42) {
     return invalidPostureFrame(
       landmarks,
       confidence,
@@ -435,16 +454,16 @@ function extractPostureFrame(result: PoseResult) {
       5 + bodyVisibility * 24,
     );
   }
-  if (shoulderWidth > 0.64 || visibleHeight > 0.92 || torsoLength > 0.7) {
+  if (shoulderWidth > 0.72 || visibleHeight > 0.95 || torsoLength > 0.76) {
     return invalidPostureFrame(
       landmarks,
       confidence,
       null,
       "TOO_CLOSE",
-      29 - Math.max(shoulderWidth - 0.64, visibleHeight - 0.92) * 70,
+      29 - Math.max(shoulderWidth - 0.72, visibleHeight - 0.95) * 70,
     );
   }
-  if (shoulderWidth < 0.1 || visibleHeight < 0.23 || torsoLength < 0.14) {
+  if (shoulderWidth < 0.08 || visibleHeight < 0.18 || torsoLength < 0.11) {
     return invalidPostureFrame(
       landmarks,
       confidence,
@@ -735,7 +754,7 @@ function drawPostureOverlay(
     context.restore();
   };
   const joint = (point: PosePoint | undefined | null, color: string, radius = 8) => {
-    if (!usablePosturePoint(point ?? undefined, 0.48)) return;
+    if (!point || !usablePosturePoint(point, 0.48)) return;
     const projected = project(point);
     context.save();
     context.beginPath();
@@ -1593,7 +1612,7 @@ export default function Home() {
                 <div
                   className="posture-calibration"
                   data-phase={posturePhase}
-                  data-state={postureCameraFeedback.tone === "green" ? "ready" : "bad"}
+                  data-state={postureCameraFeedback.tone === "green" ? "ready" : postureCameraFeedback.tone === "red" ? "bad" : "calibrating"}
                 >
                   <div>
                     <span>{postureStage.label}</span>
@@ -1641,7 +1660,7 @@ export default function Home() {
               <span>LIVE DASHBOARD</span>
               <span id="timerTop">{formatTime(seconds)}</span>
             </div>
-            <div className={`score-ring ${mode === "posture" ? !cameraOn ? "posture-paused" : postureCameraFeedback.tone === "green" ? "posture-good" : "posture-bad" : ""}`}>
+            <div className={`score-ring ${mode === "posture" ? !cameraOn || postureCameraFeedback.tone === "neutral" ? "posture-paused" : postureCameraFeedback.tone === "green" ? "posture-good" : "posture-bad" : ""}`}>
               <strong id="overallScore">{dashboardScores[0].value ?? "—"}</strong>
               <span>{mode === "posture" ? "POSTURE SCORE" : "OVERALL SCORE"}</span>
             </div>
