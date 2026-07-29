@@ -62,8 +62,10 @@ type PostureMeasurement = {
 
 type PostureScores = {
   neck: number;
-  shoulders: number;
-  back: number;
+  head: number;
+  shoulderLevel: number;
+  upperBack: number;
+  framing: number;
 };
 
 type PostureFlags = {
@@ -84,8 +86,8 @@ const VISION_WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3
 const POSE_MODEL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
 const POSTURE_BASELINE_KEY = "hoopvision-posture-baseline-v3";
 const POSTURE_WINDOW_MS = 2000;
-const POSTURE_LANDMARK_CONFIDENCE = 0.6;
-const POSTURE_HIP_CONFIDENCE = 0.55;
+const POSTURE_LANDMARK_CONFIDENCE = 0.5;
+const POSTURE_HIP_CONFIDENCE = 0.45;
 
 const correctionCopy: Record<Exclude<PostureCorrection, null>, string> = {
   head: "Move your head back",
@@ -139,26 +141,25 @@ function getPostureCameraFeedback({
 }): PostureCameraFeedback {
   const rawScore = Number.isFinite(score) ? Number(score) : 0;
   const invalidView = !fullPoseReady ||
-    confidence < 60 ||
+    confidence < 50 ||
     facingConfidence === null ||
     facingConfidence < 0.5 ||
     status === "TURNED_AWAY" ||
     status === "TOO_CLOSE" ||
     status === "TOO_FAR" ||
     status === "LOW_CONFIDENCE";
+  const scoringReady = phase === "active" || phase === "ready";
   const safeScore = !cameraOn ||
-    phase !== "active" ||
-    !calibrated ||
+    !scoringReady ||
     status === "NO_PERSON"
     ? 0
     : invalidView
       ? clamp(rawScore, 0, 29)
       : clamp(rawScore, 0, 100);
   const green = cameraOn &&
-    phase === "active" &&
-    calibrated &&
+    scoringReady &&
     fullPoseReady &&
-    confidence >= 60 &&
+    confidence >= 50 &&
     facingConfidence !== null &&
     facingConfidence >= 0.5 &&
     status === "GOOD_POSTURE" &&
@@ -526,10 +527,15 @@ function aggregateMeasurements(samples: PostureMeasurement[], useMedian = false)
     "cameraScale",
   ];
   return keys.reduce((result, key) => {
-    const values = samples.map((sample) => sample[key]).sort((a, b) => a - b);
-    result[key] = useMedian
-      ? values[Math.floor(values.length / 2)]
-      : values.reduce((total, value) => total + value, 0) / Math.max(1, values.length);
+    const values = samples
+      .map((sample) => sample[key])
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b);
+    result[key] = values.length === 0
+      ? 0
+      : useMedian
+        ? values[Math.floor(values.length / 2)]
+        : values.reduce((total, value) => total + value, 0) / values.length;
     return result;
   }, {} as PostureMeasurement);
 }
@@ -551,44 +557,75 @@ function validBaseline(value: unknown): value is PostureMeasurement {
 
 function evaluatePosture(
   measurement: PostureMeasurement,
-  baseline: PostureMeasurement,
+  baseline: PostureMeasurement | null,
   previous: PostureFlags,
 ) {
-  const headAngleDelta = Math.max(0, measurement.neckAngle - baseline.neckAngle);
-  const headDepthDelta = Math.max(0, measurement.headDepth - baseline.headDepth);
-  const headOffsetDelta = Math.max(0, measurement.headOffset - baseline.headOffset);
-  const shoulderDelta = Math.abs(measurement.shoulderTilt - baseline.shoulderTilt);
-  const torsoAngleDelta = Math.abs(measurement.torsoAngle - baseline.torsoAngle);
-  const torsoCompression = Math.max(0, baseline.torsoRatio - measurement.torsoRatio);
+  const finite = Object.values(measurement).every(Number.isFinite);
+  if (!finite) {
+    const scores: PostureScores = {
+      neck: 0,
+      head: 0,
+      shoulderLevel: 0,
+      upperBack: 0,
+      framing: 0,
+    };
+    return {
+      correction: null as PostureCorrection,
+      flags: { head: false, shoulders: false, back: false },
+      scores,
+      score: 0,
+      status: "LOW_CONFIDENCE" as PostureStatus,
+    };
+  }
+
+  const neckReference = baseline?.neckAngle ?? 6;
+  const headOffsetReference = baseline?.headOffset ?? 0.08;
+  const shoulderReference = baseline?.shoulderTilt ?? 1.5;
+  const torsoReference = baseline?.torsoAngle ?? 4;
+  const headAngleDelta = Math.max(0, measurement.neckAngle - neckReference - 3);
+  const headDepthDelta = baseline
+    ? Math.max(0, measurement.headDepth - baseline.headDepth - 0.025)
+    : 0;
+  const headOffsetDelta = Math.max(0, measurement.headOffset - headOffsetReference - 0.05);
+  const shoulderDelta = Math.max(0, measurement.shoulderTilt - shoulderReference - 2);
+  const torsoAngleDelta = Math.max(0, measurement.torsoAngle - torsoReference - 3);
+  const torsoCompression = baseline
+    ? Math.max(0, baseline.torsoRatio - measurement.torsoRatio - 0.05)
+    : 0;
 
   const severities = {
-    slouch: Math.max(
-      headAngleDelta / 15,
-      headDepthDelta / 0.11,
-      torsoCompression / 0.22,
-      Math.max(0, measurement.neckAngle - 16) / 24,
-    ),
-    lean: Math.max(
-      torsoAngleDelta / 16,
-      headOffsetDelta / 0.58,
-      Math.max(0, measurement.torsoAngle - 13) / 24,
-    ),
-    shoulders: Math.max(
-      shoulderDelta / 10,
-      Math.max(0, measurement.shoulderTilt - 5) / 13,
-    ),
+    slouch: clamp(Math.max(headAngleDelta / 18, headDepthDelta / 0.13, torsoCompression / 0.25), 0, 1.5),
+    lean: clamp(Math.max(torsoAngleDelta / 18, headOffsetDelta / 0.5), 0, 1.5),
+    shoulders: clamp(shoulderDelta / 12, 0, 1.5),
   };
+  const framingSeverity = clamp(
+    Math.max(
+      (0.58 - measurement.bodyVisibility) / 0.35,
+      (0.5 - measurement.facingConfidence) / 0.35,
+      measurement.cameraScale < 0.12 ? (0.12 - measurement.cameraScale) / 0.08 : 0,
+      measurement.cameraScale > 0.58 ? (measurement.cameraScale - 0.58) / 0.18 : 0,
+    ),
+    0,
+    1.5,
+  );
+  const scores: PostureScores = {
+    neck: Math.round(clamp(100 - Math.max(headAngleDelta / 18, headDepthDelta / 0.13) * 70, 0, 100)),
+    head: Math.round(clamp(100 - Math.max(headOffsetDelta / 0.5, headDepthDelta / 0.13) * 70, 0, 100)),
+    shoulderLevel: Math.round(clamp(100 - severities.shoulders * 70, 0, 100)),
+    upperBack: Math.round(clamp(100 - Math.max(torsoAngleDelta / 18, torsoCompression / 0.25) * 70, 0, 100)),
+    framing: Math.round(clamp(100 - framingSeverity * 70, 0, 100)),
+  };
+  const score = Math.round(clamp(
+    scores.neck * 0.22 +
+      scores.head * 0.18 +
+      scores.shoulderLevel * 0.18 +
+      scores.upperBack * 0.27 +
+      scores.framing * 0.15,
+    0,
+    100,
+  ));
   const dominant = (Object.keys(severities) as (keyof typeof severities)[])
     .sort((a, b) => severities[b] - severities[a])[0];
-  const dominantSeverity = severities[dominant];
-  const secondarySeverity = Object.entries(severities)
-    .filter(([key]) => key !== dominant)
-    .reduce((total, [, value]) => total + value, 0);
-  const score = clamp(
-    Math.round(100 - dominantSeverity * 46 - secondarySeverity * 8),
-    30,
-    100,
-  );
   const status: PostureStatus = score >= 85
     ? "GOOD_POSTURE"
     : dominant === "shoulders"
@@ -609,12 +646,6 @@ function evaluatePosture(
       : status === "LEANING"
         ? "back"
         : null;
-  const scores: PostureScores = {
-    neck: Math.round(clamp(100 - severities.slouch * 52, 0, 100)),
-    shoulders: Math.round(clamp(100 - severities.shoulders * 52, 0, 100)),
-    back: Math.round(clamp(100 - severities.lean * 52, 0, 100)),
-  };
-
   return { correction, flags, scores, score, status };
 }
 
@@ -767,7 +798,13 @@ export default function Home() {
   const [posturePhase, setPosturePhase] = useState<PosturePhase>("idle");
   const [postureInstruction, setPostureInstruction] = useState("Start the camera to begin");
   const [postureScore, setPostureScore] = useState<number | null>(null);
-  const [postureScores, setPostureScores] = useState<PostureScores>({ neck: 0, shoulders: 0, back: 0 });
+  const [postureScores, setPostureScores] = useState<PostureScores>({
+    neck: 0,
+    head: 0,
+    shoulderLevel: 0,
+    upperBack: 0,
+    framing: 0,
+  });
   const [postureConfidence, setPostureConfidence] = useState(0);
   const [postureCorrection, setPostureCorrection] = useState<PostureCorrection>(null);
   const [postureCalibrated, setPostureCalibrated] = useState(false);
@@ -911,7 +948,7 @@ export default function Home() {
           postureScoreUpdatedAtRef.current = 0;
           sustainedBadRef.current = null;
           setPostureScore(0);
-          setPostureScores({ neck: 0, shoulders: 0, back: 0 });
+          setPostureScores({ neck: 0, head: 0, shoulderLevel: 0, upperBack: 0, framing: 0 });
           setPostureStatus("NO_PERSON");
           setPostureCorrection(null);
           setPostureAngles(null);
@@ -972,8 +1009,10 @@ export default function Home() {
             setPostureScore(invalidScore);
             setPostureScores({
               neck: invalidScore,
-              shoulders: invalidScore,
-              back: invalidScore,
+              head: invalidScore,
+              shoulderLevel: invalidScore,
+              upperBack: invalidScore,
+              framing: invalidScore,
             });
             postureDisplayedScoreRef.current = invalidScore;
             postureScoreUpdatedAtRef.current = 0;
@@ -1043,7 +1082,7 @@ export default function Home() {
           }
 
           const baseline = postureBaselineRef.current;
-          if (!baseline) {
+          if (false && !baseline) {
             setPostureCameraState("Stage 2 · Ready to calibrate");
             setPosturePhase("ready");
             setPostureScore(null);
@@ -1162,16 +1201,16 @@ export default function Home() {
   const dashboardScores: { label: string; value: number | null }[] = mode === "posture"
     ? [
         { label: "Overall", value: cameraOn ? postureCameraFeedback.score : null },
-        { label: "Neck", value: !cameraOn || postureScore === null ? null : postureScores.neck },
-        { label: "Shoulders", value: !cameraOn || postureScore === null ? null : postureScores.shoulders },
-        { label: "Upper back", value: !cameraOn || postureScore === null ? null : postureScores.back },
-        { label: "Confidence", value: cameraOn ? postureConfidence : null },
+        { label: "Neck alignment", value: !cameraOn || postureScore === null ? null : postureScores.neck },
+        { label: "Head position", value: !cameraOn || postureScore === null ? null : postureScores.head },
+        { label: "Shoulder level", value: !cameraOn || postureScore === null ? null : postureScores.shoulderLevel },
+        { label: "Upper-back angle", value: !cameraOn || postureScore === null ? null : postureScores.upperBack },
+        { label: "Body framing", value: !cameraOn || postureScore === null ? null : postureScores.framing },
       ]
     : scores;
   const postureAlerting = mode === "posture" &&
     cameraOn &&
     posturePhase === "active" &&
-    postureCalibrated &&
     postureCameraFeedback.tone === "red";
   const correctionHot = mode === "posture"
     ? postureAlerting
