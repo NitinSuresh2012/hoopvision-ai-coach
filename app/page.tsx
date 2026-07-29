@@ -84,10 +84,9 @@ type CalibrationRun = {
 const VISION_CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/vision_bundle.mjs";
 const VISION_WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm";
 const POSE_MODEL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
-const POSTURE_BASELINE_KEY = "hoopvision-posture-baseline-v3";
 const POSTURE_WINDOW_MS = 2000;
 const POSTURE_LANDMARK_CONFIDENCE = 0.5;
-const POSTURE_HIP_CONFIDENCE = 0.32;
+const POSTURE_HIP_CONFIDENCE = 0.18;
 
 const correctionCopy: Record<Exclude<PostureCorrection, null>, string> = {
   head: "Move your head back",
@@ -352,24 +351,6 @@ function extractPostureFrame(result: PoseResult) {
   const rightShoulder = landmarks[12];
   const leftHip = landmarks[23];
   const rightHip = landmarks[24];
-  const faceSupportConfidence = Math.max(
-    pointConfidence(leftEye),
-    pointConfidence(rightEye),
-    pointConfidence(leftEar),
-    pointConfidence(rightEar),
-  );
-  const essentialConfidences = [
-    pointConfidence(nose),
-    faceSupportConfidence,
-    pointConfidence(leftShoulder),
-    pointConfidence(rightShoulder),
-    pointConfidence(leftHip),
-    pointConfidence(rightHip),
-  ];
-  const confidence = essentialConfidences.reduce(
-    (total, value) => total + value,
-    0,
-  ) / essentialConfidences.length;
   const shoulderConfidence = Math.min(
     pointConfidence(leftShoulder),
     pointConfidence(rightShoulder),
@@ -378,20 +359,38 @@ function extractPostureFrame(result: PoseResult) {
     pointConfidence(leftHip),
     pointConfidence(rightHip),
   );
-  const torsoConfidence = Math.min(shoulderConfidence, hipConfidence);
   const eyeConfidence = Math.max(pointConfidence(leftEye), pointConfidence(rightEye));
   const earConfidence = Math.max(pointConfidence(leftEar), pointConfidence(rightEar));
   const faceConfidence = Math.min(
     pointConfidence(nose),
     Math.max(eyeConfidence, earConfidence),
   );
+  const confidence = clamp(
+    faceConfidence * 0.3 +
+      shoulderConfidence * 0.5 +
+      hipConfidence * 0.2,
+    0,
+    1,
+  );
   const bodyVisibility = clamp(
-    torsoConfidence * 0.58 + faceConfidence * 0.3 + confidence * 0.12,
+    shoulderConfidence * 0.42 +
+      hipConfidence * 0.2 +
+      faceConfidence * 0.28 +
+      confidence * 0.1,
     0,
     1,
   );
 
-  if (confidence < 0.14 && torsoConfidence < 0.18) {
+  const detectedUpperBodyPoints = [
+    nose,
+    leftEye,
+    rightEye,
+    leftEar,
+    rightEar,
+    leftShoulder,
+    rightShoulder,
+  ].filter((point) => pointConfidence(point) >= 0.12).length;
+  if (detectedUpperBodyPoints < 2 && shoulderConfidence < 0.12) {
     return invalidPostureFrame(landmarks, confidence, "pose", "NO_PERSON", 0);
   }
 
@@ -445,7 +444,12 @@ function extractPostureFrame(result: PoseResult) {
   const visibleHeight = hipMid.y - headAnchor.y;
   const torsoLength = pointDistance(shoulderMid, hipMid);
 
-  if (confidence < 0.42 || shoulderConfidence < 0.45 || hipConfidence < POSTURE_HIP_CONFIDENCE || bodyVisibility < 0.42) {
+  if (
+    confidence < 0.34 ||
+    shoulderConfidence < 0.4 ||
+    hipConfidence < POSTURE_HIP_CONFIDENCE ||
+    bodyVisibility < 0.34
+  ) {
     return invalidPostureFrame(
       landmarks,
       confidence,
@@ -563,21 +567,6 @@ function aggregateMeasurements(samples: PostureMeasurement[], useMedian = false)
   }, {} as PostureMeasurement);
 }
 
-function validBaseline(value: unknown): value is PostureMeasurement {
-  if (!value || typeof value !== "object") return false;
-  return [
-    "neckAngle",
-    "shoulderTilt",
-    "torsoAngle",
-    "torsoRatio",
-    "headDepth",
-    "headOffset",
-    "bodyVisibility",
-    "facingConfidence",
-    "cameraScale",
-  ].every((key) => Number.isFinite((value as Record<string, unknown>)[key]));
-}
-
 function evaluatePosture(
   measurement: PostureMeasurement,
   baseline: PostureMeasurement | null,
@@ -685,7 +674,7 @@ function drawPostureOverlay(
 ) {
   const box = canvas.getBoundingClientRect();
   if (!box.width || !box.height || !video.videoWidth || !video.videoHeight) return;
-  const pixelRatio = window.devicePixelRatio || 1;
+  const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
   const targetWidth = Math.round(box.width * pixelRatio);
   const targetHeight = Math.round(box.height * pixelRatio);
   if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
@@ -837,6 +826,7 @@ export default function Home() {
   const [postureAngles, setPostureAngles] = useState<PostureMeasurement | null>(null);
   const [postureFullPoseReady, setPostureFullPoseReady] = useState(false);
   const cameraRef = useRef<HTMLVideoElement>(null);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
   const postureCanvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const poseLandmarkerRef = useRef<PoseLandmarkerInstance | null>(null);
@@ -855,6 +845,7 @@ export default function Home() {
   const lastInferenceRef = useRef(0);
   const audioContextRef = useRef<AudioContext | null>(null);
   const voiceOnRef = useRef(voiceOn);
+  const chatResponseTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!cameraOn) return;
@@ -869,22 +860,6 @@ export default function Home() {
   }, [cameraOn, mode]);
 
   useEffect(() => {
-    const frame = window.requestAnimationFrame(() => {
-      try {
-        const stored = window.localStorage.getItem(POSTURE_BASELINE_KEY);
-        const baseline = stored ? JSON.parse(stored) : null;
-        if (validBaseline(baseline)) {
-          postureBaselineRef.current = baseline;
-          setPostureCalibrated(true);
-        }
-      } catch {
-        // Local storage can be unavailable in private browsing; live calibration still works.
-      }
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, []);
-
-  useEffect(() => {
     voiceOnRef.current = voiceOn;
   }, [voiceOn]);
 
@@ -892,6 +867,8 @@ export default function Home() {
     return () => {
       streamRef.current?.getTracks().forEach((track) => track.stop());
       if (postureAnimationRef.current !== null) window.cancelAnimationFrame(postureAnimationRef.current);
+      if (chatResponseTimerRef.current !== null) window.clearTimeout(chatResponseTimerRef.current);
+      window.speechSynthesis?.cancel();
       poseLandmarkerRef.current?.close?.();
       void audioContextRef.current?.close();
     };
@@ -920,7 +897,7 @@ export default function Home() {
       await Promise.resolve();
       if (cancelled) return;
       setPosturePhase("loading");
-      setPostureScore(0);
+      setPostureScore(null);
       setPostureStatus("NO_PERSON");
       setPostureCorrection(null);
       setPostureInstruction("Loading posture model");
@@ -1125,11 +1102,6 @@ export default function Home() {
               setPosturePhase("active");
               setPostureInstruction("Calibration saved");
               setCalibrationProgress(100);
-              try {
-                window.localStorage.setItem(POSTURE_BASELINE_KEY, JSON.stringify(baseline));
-              } catch {
-                // The baseline remains available for this session if storage is blocked.
-              }
             }
             return;
           }
@@ -1285,10 +1257,51 @@ export default function Home() {
     if (audioContextRef.current.state === "suspended") void audioContextRef.current.resume();
   };
 
+  const stopCameraSession = () => {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    if (cameraRef.current) cameraRef.current.srcObject = null;
+    setCameraOn(false);
+    calibrationRef.current = null;
+    postureWindowRef.current = [];
+    sustainedBadRef.current = null;
+    setPosturePhase("idle");
+    setPostureScore(null);
+    setPostureScores({ neck: 0, head: 0, shoulderLevel: 0, upperBack: 0, framing: 0 });
+    setPostureCorrection(null);
+    setPostureAngles(null);
+    setPostureConfidence(0);
+    setPostureCameraState("Waiting for camera");
+    setPostureInstruction("Start the camera to begin");
+    setCalibrationProgress(0);
+    setPostureFullPoseReady(false);
+    setPostureStatus("NO_PERSON");
+  };
+
   const selectMode = (nextMode: Mode) => {
     if (nextMode === "posture") ensurePostureAudio();
+    if (nextMode === "upload" && cameraOn) stopCameraSession();
+    if (nextMode === "posture" && mode !== "posture") {
+      postureBaselineRef.current = null;
+      calibrationRef.current = null;
+      setPostureCalibrated(false);
+      setPostureScore(null);
+      setCalibrationProgress(0);
+      setPostureInstruction(
+        cameraOn
+          ? "Sit or stand upright for automatic calibration"
+          : "Start the camera to begin",
+      );
+    }
     setPostureFullPoseReady(false);
     setMode(nextMode);
+  };
+
+  const goToLive = (nextMode: Mode = "basketball") => {
+    selectMode(nextMode);
+    window.requestAnimationFrame(() => {
+      document.getElementById("live")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
   };
 
   const beginCalibration = () => {
@@ -1340,20 +1353,7 @@ export default function Home() {
 
   const startCamera = async () => {
     if (cameraOn) {
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-      setCameraOn(false);
-      calibrationRef.current = null;
-      setPosturePhase("idle");
-      setPostureScore(null);
-      setPostureCorrection(null);
-      setPostureAngles(null);
-      setPostureConfidence(0);
-      setPostureCameraState("Waiting for camera");
-      setPostureInstruction("Start the camera to begin");
-      setCalibrationProgress(0);
-      setPostureFullPoseReady(false);
-      setPostureStatus("NO_PERSON");
+      stopCameraSession();
       return;
     }
     try {
@@ -1405,6 +1405,19 @@ export default function Home() {
   const handleUpload = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
+    const acceptedTypes = new Set(["video/mp4", "video/quicktime", "video/webm"]);
+    if (!acceptedTypes.has(file.type)) {
+      setChatOpen(true);
+      setChat((items) => [...items, { who: "coach", text: "Choose an MP4, MOV, or WebM basketball video." }]);
+      event.target.value = "";
+      return;
+    }
+    if (file.size > 500 * 1024 * 1024) {
+      setChatOpen(true);
+      setChat((items) => [...items, { who: "coach", text: "That video is over 500 MB. Choose a shorter or compressed clip." }]);
+      event.target.value = "";
+      return;
+    }
     setMode("upload");
     setVideoName(file.name);
   };
@@ -1415,7 +1428,8 @@ export default function Home() {
     const prompt = message.trim();
     setChat((items) => [...items, { who: "you", text: prompt }]);
     setMessage("");
-    window.setTimeout(() => {
+    if (chatResponseTimerRef.current !== null) window.clearTimeout(chatResponseTimerRef.current);
+    chatResponseTimerRef.current = window.setTimeout(() => {
       setChat((items) => [
         ...items,
         {
@@ -1430,6 +1444,7 @@ export default function Home() {
               : "Your base is strong. Fix the red knee drift first, then speed up the gather once the landing turns green.",
         },
       ]);
+      chatResponseTimerRef.current = null;
     }, 420);
   };
 
@@ -1499,7 +1514,7 @@ export default function Home() {
           <a href="#progress">Progress</a>
           <a href="#pricing">Pricing</a>
         </nav>
-        <a className="sign-in" href="#profile">Sign In <Arrow /></a>
+        <a className="sign-in" href="#coach">Coach Dashboard <Arrow /></a>
       </header>
 
       <section className="hero" id="home">
@@ -1522,7 +1537,7 @@ export default function Home() {
           <p>One AI performance system for live form correction, skill tracking, game-film intelligence, pro comparison, and a development plan built around you.</p>
           <div className="hero-actions">
             <a className="button button-primary" href="#live">Start Live Coaching <Arrow /></a>
-            <button className="button button-ghost" data-mode="posture" onClick={() => selectMode("posture")}>Try Posture Mode</button>
+            <button className="button button-ghost" data-mode="posture" onClick={() => goToLive("posture")}>Try Posture Mode</button>
           </div>
         </div>
         <div className="hero-panel glass">
@@ -1649,9 +1664,19 @@ export default function Home() {
               ) : null}
               <label className="button button-ghost">
                 Upload Clip
-                <input id="uploadInput" type="file" accept="video/mp4,video/quicktime,video/webm" onChange={handleUpload} />
+                <input ref={uploadInputRef} id="uploadInput" type="file" accept="video/mp4,video/quicktime,video/webm" onChange={handleUpload} />
               </label>
-              <button className="delete-button" id="deleteVideo" hidden={!videoName} onClick={() => setVideoName("")}>Delete {videoName || "clip"}</button>
+              <button
+                className="delete-button"
+                id="deleteVideo"
+                hidden={!videoName}
+                onClick={() => {
+                  setVideoName("");
+                  if (uploadInputRef.current) uploadInputRef.current.value = "";
+                }}
+              >
+                Delete {videoName || "clip"}
+              </button>
             </div>
           </div>
 
@@ -1791,10 +1816,13 @@ export default function Home() {
                 <button
                   className={activeDrill === index ? "active" : ""}
                   data-drill={index}
+                  id={`training-tab-${index}`}
                   key={drill.title}
                   onClick={() => setActiveDrill(index)}
                   role="tab"
+                  aria-controls="training-panel"
                   aria-selected={activeDrill === index}
+                  tabIndex={activeDrill === index ? 0 : -1}
                 >
                   <span>0{index + 1}</span>
                   <div><strong>{drill.title}</strong><small>{drill.focus}</small></div>
@@ -1809,7 +1837,7 @@ export default function Home() {
             </div>
           </aside>
 
-          <div className="drill-workspace">
+            <div className="drill-workspace" id="training-panel" role="tabpanel" aria-labelledby={`training-tab-${activeDrill}`}>
             <div className="workspace-bar">
               <span>LIVE DRILL PREVIEW</span>
               <b>Generated from your last 42 reps</b>
@@ -1844,7 +1872,7 @@ export default function Home() {
                   <div><span>Movement match</span><b id="drillMatch">74 → {drills[activeDrill].target}</b></div>
                   <i><em id="drillProgress" style={{ width: `${drills[activeDrill].target}%` }} /></i>
                 </div>
-                <button className="start-workout">Start live workout <Arrow /></button>
+                <button className="start-workout" onClick={() => goToLive("basketball")}>Start live workout <Arrow /></button>
               </div>
             </div>
             <div className="training-loop">
@@ -2038,7 +2066,7 @@ export default function Home() {
         <div className="legacy-roster-shell glass">
           <div className="legacy-roster-bar">
             <div><span>HOOPVISION AI</span><b><i /> Live roster</b></div>
-            <button>View team <Arrow /></button>
+            <button onClick={() => document.querySelector(".legacy-player-list")?.scrollIntoView({ behavior: "smooth", block: "center" })}>View team <Arrow /></button>
           </div>
           <div className="legacy-roster-head" aria-hidden="true">
             <span>Player</span><span>Current focus</span><span>AI score</span><span>Live status</span><span />
@@ -2053,7 +2081,13 @@ export default function Home() {
                 <div className="legacy-focus"><strong>{athlete.focus}</strong><small>AI session</small></div>
                 <div className="legacy-score"><strong>{athlete.score}</strong><small>/ 100</small></div>
                 <div className="legacy-status"><i /><span>{athlete.status}</span></div>
-                <button aria-label={`Open ${athlete.name} player profile`}><Arrow /></button>
+                <button
+                  aria-label={`Open ${athlete.name} player profile`}
+                  onClick={() => {
+                    setChatOpen(true);
+                    setMessage(`Review ${athlete.name}'s ${athlete.focus.toLowerCase()} session`);
+                  }}
+                ><Arrow /></button>
               </article>
             ))}
           </div>
@@ -2122,9 +2156,9 @@ export default function Home() {
           </div>
           <div>
             <p>Go live free. Upgrade when coaching becomes your habit.</p>
-            <div className="billing-toggle" aria-label="Billing period">
-              <button data-billing="monthly" className={!annualBilling ? "active" : ""} onClick={() => setAnnualBilling(false)}>Monthly</button>
-              <button data-billing="annual" className={annualBilling ? "active" : ""} onClick={() => setAnnualBilling(true)}>Annual <span>Save 20%</span></button>
+            <div className="billing-toggle" role="group" aria-label="Billing period">
+              <button aria-pressed={!annualBilling} data-billing="monthly" className={!annualBilling ? "active" : ""} onClick={() => setAnnualBilling(false)}>Monthly</button>
+              <button aria-pressed={annualBilling} data-billing="annual" className={annualBilling ? "active" : ""} onClick={() => setAnnualBilling(true)}>Annual <span>Save 20%</span></button>
             </div>
           </div>
         </div>
@@ -2146,7 +2180,7 @@ export default function Home() {
                 <span key={feature}><i>✓</i>{feature}</span>
               ))}
             </div>
-            <button>Start Elite free <Arrow /></button>
+            <button onClick={() => goToLive("basketball")}>Start Elite free <Arrow /></button>
           </article>
 
           <div className="secondary-plans">
@@ -2157,7 +2191,9 @@ export default function Home() {
                 <ul>
                   {plan.features.map((feature) => <li key={feature}>{feature}</li>)}
                 </ul>
-                <button>{plan.price ? "Open Coach OS" : "Train free"} <Arrow /></button>
+                <button onClick={() => plan.price ? document.getElementById("coach")?.scrollIntoView({ behavior: "smooth" }) : goToLive("basketball")}>
+                  {plan.price ? "Open Coach OS" : "Train free"} <Arrow />
+                </button>
               </article>
             ))}
           </div>
@@ -2170,7 +2206,7 @@ export default function Home() {
         </div>
         <div className="launch-banner" id="profile">
           <div><span>HOOPVISION AI</span><h3>Your live coach is ready.</h3></div>
-          <button>Start your first session <Arrow /></button>
+          <button onClick={() => goToLive("basketball")}>Start your first session <Arrow /></button>
         </div>
       </section>
 
@@ -2179,13 +2215,20 @@ export default function Home() {
         <p>Elite basketball coaching powered by advanced AI. From the live rep to the film room, development plan, and scouting report.</p>
       </footer>
 
-      <button className="chat-trigger" id="chatTrigger" onClick={() => setChatOpen(!chatOpen)} aria-label="Open AI coach chat">
+      <button
+        className="chat-trigger"
+        id="chatTrigger"
+        onClick={() => setChatOpen(!chatOpen)}
+        aria-label="Open AI coach chat"
+        aria-controls="chatPanel"
+        aria-expanded={chatOpen}
+      >
         <Mark /> Ask Coach V
       </button>
-      <aside className="chat-panel glass" id="chatPanel" hidden={!chatOpen} aria-label="AI coach chat">
+      <aside className="chat-panel glass" id="chatPanel" hidden={!chatOpen} aria-label="AI coach chat" aria-live="polite">
           <div className="chat-head">
             <span><b>Coach V</b><small>AI live coach</small></span>
-            <button id="closeChat" onClick={() => setChatOpen(false)} aria-label="Close chat">x</button>
+            <button id="closeChat" onClick={() => setChatOpen(false)} aria-label="Close chat">×</button>
           </div>
           <div className="chat-messages" id="chatMessages">
             {chat.map((item, index) => (
@@ -2196,8 +2239,15 @@ export default function Home() {
             ))}
           </div>
           <form id="chatForm" onSubmit={sendMessage}>
-            <input id="chatInput" value={message} onChange={(event) => setMessage(event.target.value)} placeholder="Ask for a correction..." />
-            <button>Send</button>
+            <input
+              id="chatInput"
+              value={message}
+              onChange={(event) => setMessage(event.target.value)}
+              placeholder="Ask for a correction..."
+              aria-label="Message Coach V"
+              maxLength={500}
+            />
+            <button disabled={!message.trim()}>Send</button>
           </form>
       </aside>
     </main>
