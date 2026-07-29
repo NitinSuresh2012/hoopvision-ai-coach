@@ -252,8 +252,8 @@ const athletes = [
 ];
 const plans = [
   { name: "Rookie", price: 0, audience: "Explore the system", features: ["Live coach demo", "Core movement scores", "2 video reviews"] },
-  { name: "Elite", price: 24, audience: "Build your game", features: ["Unlimited live coaching", "Voice cues + Film IQ", "Pro compare + reports"] },
-  { name: "Coach", price: 69, audience: "Develop a roster", features: ["25 athlete profiles", "Team intelligence", "Assignments + exports"] },
+  { name: "Elite", price: 5, audience: "Build your game", features: ["Unlimited live coaching", "Voice cues + Film IQ", "Pro compare + reports"] },
+  { name: "Coach", price: 20, audience: "Develop a roster", features: ["25 athlete profiles", "Team intelligence", "Assignments + exports"] },
 ];
 const intelligenceTabs: { id: IntelligenceView; label: string }[] = [
   { id: "film", label: "Game Film IQ" },
@@ -801,7 +801,7 @@ export default function Home() {
   const [intelligenceView, setIntelligenceView] = useState<IntelligenceView>("film");
   const [reportReady, setReportReady] = useState(false);
   const [activeDrill, setActiveDrill] = useState(0);
-  const [annualBilling, setAnnualBilling] = useState(true);
+  const [annualBilling, setAnnualBilling] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [message, setMessage] = useState("");
   const [chat, setChat] = useState([
@@ -2171,7 +2171,7 @@ export default function Home() {
               <span>{plans[1].name}</span>
               <h3>Your AI coach. Every session.</h3>
               <div className="plan-price">
-                <strong id="elitePrice">${annualBilling ? "19" : plans[1].price}</strong>
+                <strong id="elitePrice">${annualBilling ? "4" : plans[1].price}</strong>
                 <span>/ month<small id="eliteBilling">{annualBilling ? "billed annually" : "cancel anytime"}</small></span>
               </div>
             </div>
