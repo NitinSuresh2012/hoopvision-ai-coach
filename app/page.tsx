@@ -1650,23 +1650,22 @@ export default function Home() {
       <section className="section capabilities-section" id="capabilities">
         <div className="story-heading">
           <div>
-            <span className="section-no">02 / THE PERFORMANCE LOOP</span>
-            <h2>One session. Everything connected.</h2>
+            <span className="section-no">02 / FROM MISTAKES TO MUSCLE MEMORY</span>
+            <h2>See it. Fix it. Master it.</h2>
           </div>
-          <p>The camera sees it. Coach V fixes it. Your plan evolves.</p>
+          <p>Every practice becomes smarter with live AI coaching.</p>
         </div>
         <div className="performance-loop glass">
           {[
-            ["01", "See", "Computer vision tracks the movement.", "33 landmarks"],
-            ["02", "Correct", "Red becomes one clear live cue.", "<120ms target"],
-            ["03", "Build", "The correction becomes your plan.", "Adaptive drills"],
-            ["04", "Prove", "Every cleaner rep updates progress.", "Film + trends"],
+            ["01", "Analyze", "Every movement is tracked."],
+            ["02", "Correct", "Fix mistakes as they happen."],
+            ["03", "Repeat", "Practice exactly what you need."],
+            ["04", "Master", "Watch your game level up."],
           ].map((step) => (
             <article key={step[1]}>
               <span>{step[0]}</span>
               <h3>{step[1]}</h3>
               <p>{step[2]}</p>
-              <b>{step[3]}</b>
             </article>
           ))}
           <i className="loop-signal" />
